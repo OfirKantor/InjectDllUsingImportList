@@ -6,7 +6,7 @@
 #ifdef WIN64
 uint64_t ordinal = 0x8000000000000001;
 #else
-uint32_t ordinal = 0x80000001 ;
+uint32_t ordinal = 0x80000001;
 #endif
 
 typedef NTSTATUS
