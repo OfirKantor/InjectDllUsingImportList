@@ -9,7 +9,7 @@
 // We tell the loader to look for a function by its ordinal number - 1.
 // To make the loader look by ordinal numbert, we set the highest bit to 1.
 // (https://learn.microsoft.com/en-us/archive/msdn-magazine/2002/march/inside-windows-an-in-depth-look-into-the-win32-portable-executable-file-format-part-2)
-#ifdef WIN64
+#ifdef _WIN64
 uint64_t ordinal = 0x8000000000000001;
 #else
 uint32_t ordinal = 0x80000001;
@@ -31,14 +31,13 @@ pNtQueryInformationProcess NtQIP = nullptr;
 
 #define MM_ALLOCATION_GRANULARITY 0x10000
 /// <summary>
-/// 
+/// Tries to allocate memory near the module specified by the pbModule param
 /// </summary>
 /// <param name="hProcess">Handle to the remote process</param>
 /// <param name="pbModule"Base address of the module to with we want to change the imports></param>
-/// <param name="pbBase"></param>
-/// <param name="cbAlloc"></param>
+/// <param name="size">allocation size</param>
 /// <returns></returns>
-static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD cbAlloc)
+static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD size)
 {
 	MEMORY_BASIC_INFORMATION mbi;
 	ZeroMemory(&mbi, sizeof(mbi));
@@ -80,7 +79,7 @@ static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD cbAl
 		// For simplicity, we check that the offset to the last byte fits into 32 bits,
 		// instead of the largest offset we'll actually use. The values are very similar.
 		const size_t GB4 = ((((size_t)1) << 32) - 1);
-		if ((size_t)(pbAddress + cbAlloc - 1 - pbModule) > GB4) {
+		if ((size_t)(pbAddress + size - 1 - pbModule) > GB4) {
 			printf("FindAndAllocateNearBase(1) failing due to distance >4GB %p\n", pbAddress);
 			return NULL;
 		}
@@ -93,7 +92,7 @@ static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD cbAl
 			(PBYTE)mbi.BaseAddress + mbi.RegionSize);
 
 		for (; pbAddress < (PBYTE)mbi.BaseAddress + mbi.RegionSize; pbAddress += MM_ALLOCATION_GRANULARITY) {
-			PBYTE pbAlloc = (PBYTE)VirtualAllocEx(hProcess, pbAddress, cbAlloc,
+			PBYTE pbAlloc = (PBYTE)VirtualAllocEx(hProcess, pbAddress, size,
 				MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 			if (pbAlloc == NULL) {
 				printf("VirtualAllocEx(%p) failed: %lu\n", pbAddress, GetLastError());
@@ -101,19 +100,21 @@ static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD cbAl
 			}
 #ifdef _WIN64
 			// The offset from pbModule to any replacement import must fit into 32 bits.
-			if ((size_t)(pbAddress + cbAlloc - 1 - pbModule) > GB4) {
+			if ((size_t)(pbAddress + size - 1 - pbModule) > GB4) {
 				printf("FindAndAllocateNearBase(2) failing due to distance >4GB %p\n", pbAddress);
 				return NULL;
 			}
 #endif
 			printf("[%p..%p] Allocated for import table.\n",
-				pbAlloc, pbAlloc + cbAlloc);
+				pbAlloc, pbAlloc + size);
 			return pbAlloc;
 		}
 	}
 	return NULL;
 }
 
+// Allocate and write buffer into hProcess's memory
+// If that is a 64 bit process, we need to alocate memory near the base address of the module so the (DWORD) relative address pointers will work properly.
 void* WriteToRemoteProcess(HANDLE hProcess, PBYTE pbase, LPCVOID buffer, SIZE_T size) {
 
 #ifdef _WIN64
@@ -165,34 +166,11 @@ DWORD LaunchTargetProcess(const char* pExePath, HANDLE* phProcess, HANDLE* phPro
 
 DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath)
 {
-	IMAGE_DOS_HEADER ImageDosHeader;
-	IMAGE_NT_HEADERS ImageNtHeader;
-	IMAGE_NT_HEADERS ImageNtHeader_Original;
-	PROCESS_BASIC_INFORMATION ProcessBasicInfo;
-	void* dwRemotePebPtr = 0;
-	void* dwExeBaseAddr = 0;
-	void* dwNtHeaderAddr = 0;
-	DWORD dwDllPathLength = 0;
-	void* pRemoteAlloc_DllPath = NULL;
-	void* pRemoteAlloc_ImportLookupTable = NULL;
-	void* pRemoteAlloc_ImportAddressTable = NULL;
-	void* pRemoteAlloc_NewImportDescriptorList = NULL;
-	IMAGE_THUNK_DATA dwImportLookupTable[2];
-	DWORD dwExistingImportDescriptorEntryCount = 0;
-	DWORD dwNewImportDescriptorEntryCount = 0;
-	BYTE* pNewImportDescriptorList = NULL;
-	IMAGE_IMPORT_DESCRIPTOR NewDllImportDescriptors[2];
-	void* dwExistingImportDescriptorAddr = 0;
-	BYTE* pCopyImportDescriptorDataPtr = NULL;
-	DWORD dwNewImportDescriptorListDataLength = 0;
-	DWORD dwOriginalProtection = 0;
-	DWORD dwOriginalProtection2 = 0;
-	IMAGE_THUNK_DATA dwCurrentImportAddressTable[2];
-	PEB remoteExePeb;
 
 	printf("Reading image base address from PEB...\n");
 
 	// get process info
+	PROCESS_BASIC_INFORMATION ProcessBasicInfo;
 	memset(&ProcessBasicInfo, 0, sizeof(ProcessBasicInfo));
 	auto status = NtQIP(hProcess, ProcessBasicInformation, &ProcessBasicInfo, sizeof(ProcessBasicInfo), NULL);
 	if (status != 0)
@@ -200,6 +178,8 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 		return 1;
 	}
 
+	PEB remoteExePeb;
+	void* dwRemotePebPtr = 0;
 	// get target exe PEB address
 	dwRemotePebPtr = ProcessBasicInfo.PebBaseAddress;
 	if (auto ret = ReadProcessMemory(hProcess, dwRemotePebPtr, (void*)&remoteExePeb, sizeof(remoteExePeb), NULL); ret == 0)
@@ -209,7 +189,8 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	}
 
 	// get target exe base address
-	dwExeBaseAddr = remoteExePeb.ImageBaseAddress;
+	IMAGE_DOS_HEADER ImageDosHeader;
+	void* dwExeBaseAddr = remoteExePeb.ImageBaseAddress;
 	if (auto ret = ReadProcessMemory(hProcess, dwExeBaseAddr, (void*)&ImageDosHeader, sizeof(ImageDosHeader), NULL); ret == 0)
 	{
 		auto err = GetLastError();
@@ -217,7 +198,8 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	}
 
 	// read NT header from target process
-	dwNtHeaderAddr = (PBYTE)dwExeBaseAddr + ImageDosHeader.e_lfanew;
+	IMAGE_NT_HEADERS ImageNtHeader;
+	void* dwNtHeaderAddr = (PBYTE)dwExeBaseAddr + ImageDosHeader.e_lfanew;
 	memset((void*)&ImageNtHeader, 0, sizeof(ImageNtHeader));
 	if (ReadProcessMemory(hProcess, (void*)dwNtHeaderAddr, (void*)&ImageNtHeader, sizeof(ImageNtHeader), NULL) == 0)
 	{
@@ -225,32 +207,39 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	}
 
 	// save a copy of the original NT header
+	IMAGE_NT_HEADERS ImageNtHeader_Original;
 	memcpy((void*)&ImageNtHeader_Original, (void*)&ImageNtHeader, sizeof(ImageNtHeader_Original));
 
 	// calculate dll path length
-	dwDllPathLength = strlen(pDllPath) + 1;
+	DWORD dwDllPathLength = strlen(pDllPath) + 1;
 
 	// allocate buffer for the dll path in the remote process
+	void* pRemoteAlloc_DllPath = NULL;
 	if (pRemoteAlloc_DllPath = WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, pDllPath, dwDllPathLength); !pRemoteAlloc_DllPath) {
 		return 1;
 	}
 
 	// set import lookup table values (import ordinal #1)
+	IMAGE_THUNK_DATA dwImportLookupTable[2];
 	dwImportLookupTable[0].u1.Ordinal = ordinal;
 	dwImportLookupTable[1].u1.Ordinal = 0;
 
 	// allocate buffer for the new import lookup table in the remote process
+	void* pRemoteAlloc_ImportLookupTable = NULL;
 	if (pRemoteAlloc_ImportLookupTable = WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportLookupTable) {
 		return 1;
 	}
 
 
 	// allocate buffer for the new import address table in the remote process
+	void* pRemoteAlloc_ImportAddressTable = NULL;
 	if (pRemoteAlloc_ImportAddressTable = WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportAddressTable) {
 		return 1;
 	}
 
 	// set import descriptor values for injected dll
+	IMAGE_IMPORT_DESCRIPTOR NewDllImportDescriptors[2];
+
 	NewDllImportDescriptors[0].OriginalFirstThunk = (PBYTE)pRemoteAlloc_ImportLookupTable - dwExeBaseAddr;
 	NewDllImportDescriptors[0].TimeDateStamp = 0;
 	NewDllImportDescriptors[0].ForwarderChain = 0;
@@ -265,7 +254,8 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	NewDllImportDescriptors[1].FirstThunk = 0;
 
 	// calculate existing number of imported dll modules
-	dwExistingImportDescriptorEntryCount = ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+	DWORD dwExistingImportDescriptorEntryCount = ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+	DWORD dwNewImportDescriptorEntryCount = 0;
 
 	if (dwExistingImportDescriptorEntryCount == 0)
 	{
@@ -279,8 +269,8 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	}
 
 	// allocate new import description list (local)
-	dwNewImportDescriptorListDataLength = dwNewImportDescriptorEntryCount * sizeof(IMAGE_IMPORT_DESCRIPTOR);
-	pNewImportDescriptorList = (BYTE*)malloc(dwNewImportDescriptorListDataLength);
+	DWORD dwNewImportDescriptorListDataLength = dwNewImportDescriptorEntryCount * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+	auto pNewImportDescriptorList = (BYTE*)malloc(dwNewImportDescriptorListDataLength);
 	if (pNewImportDescriptorList == NULL)
 	{
 		return 1;
@@ -289,6 +279,8 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	if (dwExistingImportDescriptorEntryCount != 0)
 	{
 		// read existing import descriptor entries
+		void* dwExistingImportDescriptorAddr = 0;
+
 		dwExistingImportDescriptorAddr = (PBYTE)dwExeBaseAddr + ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
 		if (ReadProcessMemory(hProcess, (void*)dwExistingImportDescriptorAddr, pNewImportDescriptorList, dwExistingImportDescriptorEntryCount * sizeof(IMAGE_IMPORT_DESCRIPTOR), NULL) == 0)
 		{
@@ -298,7 +290,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	}
 
 	// copy the new dll import (and terminator entry) to the end of the list
-	pCopyImportDescriptorDataPtr = pNewImportDescriptorList + dwNewImportDescriptorListDataLength - sizeof(NewDllImportDescriptors);
+	BYTE* pCopyImportDescriptorDataPtr = pNewImportDescriptorList + dwNewImportDescriptorListDataLength - sizeof(NewDllImportDescriptors);
 	memcpy(pCopyImportDescriptorDataPtr, (void*)NewDllImportDescriptors, sizeof(NewDllImportDescriptors));
 	// allocate buffer for the new import descriptor list in the remote process
 	//auto pNewNearImports =  FindAndAllocateNearBase(hProcess, (PBYTE)dwExeBaseAddr, dwNewImportDescriptorListDataLength);
@@ -317,6 +309,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size = dwNewImportDescriptorListDataLength;
 
 	// make NT header writable
+	DWORD dwOriginalProtection = 0;
 	if (VirtualProtectEx(hProcess, (LPVOID)dwNtHeaderAddr, sizeof(ImageNtHeader), PAGE_EXECUTE_READWRITE, &dwOriginalProtection) == 0)
 	{
 		return 1;
@@ -339,6 +332,8 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	for (;;)
 	{
 		// read the IAT table for the injected DLL
+		IMAGE_THUNK_DATA dwCurrentImportAddressTable[2];
+
 		memset((void*)dwCurrentImportAddressTable, 0, sizeof(dwCurrentImportAddressTable));
 		if (ReadProcessMemory(hProcess, (void*)pRemoteAlloc_ImportAddressTable, (void*)dwCurrentImportAddressTable, sizeof(dwCurrentImportAddressTable), NULL) == 0)
 		{
@@ -367,6 +362,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	}
 
 	// restore original protection value for remote NT headers
+	DWORD dwOriginalProtection2 = 0;
 	if (VirtualProtectEx(hProcess, (LPVOID)dwNtHeaderAddr, sizeof(ImageNtHeader), dwOriginalProtection, &dwOriginalProtection2) == 0)
 	{
 		return 1;
@@ -376,7 +372,6 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	VirtualFreeEx(hProcess, pRemoteAlloc_DllPath, 0, MEM_RELEASE);
 	VirtualFreeEx(hProcess, pRemoteAlloc_ImportLookupTable, 0, MEM_RELEASE);
 	VirtualFreeEx(hProcess, pRemoteAlloc_ImportAddressTable, 0, MEM_RELEASE);
-	VirtualFreeEx(hProcess, pRemoteAlloc_NewImportDescriptorList, 0, MEM_RELEASE);
 	VirtualFreeEx(hProcess, (LPVOID)pNewNearImports, 0, MEM_RELEASE);
 
 	return 0;
