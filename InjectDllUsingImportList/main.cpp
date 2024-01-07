@@ -1,8 +1,14 @@
-
+//
+// // based on https://www.x86matthew.com/view_post?id=import_dll_injection greate post
+//
 #include <iostream>
 #include <windows.h>
 #include "ntdll.h"
 
+// The dll need to have at least 1 imported function in order for the loader to load the dll.
+// We tell the loader to look for a function by its ordinal number - 1.
+// To make the loader look by ordinal numbert, we set the highest bit to 1.
+// (https://learn.microsoft.com/en-us/archive/msdn-magazine/2002/march/inside-windows-an-in-depth-look-into-the-win32-portable-executable-file-format-part-2)
 #ifdef WIN64
 uint64_t ordinal = 0x8000000000000001;
 #else
@@ -19,6 +25,118 @@ typedef NTSTATUS
 	);
 
 pNtQueryInformationProcess NtQIP = nullptr;
+
+// taken from MSDetours
+//https://github.com/microsoft/Detours/tree/4b8c659f549b0ab21cf649377c7a84eb708f5e68
+
+#define MM_ALLOCATION_GRANULARITY 0x10000
+/// <summary>
+/// 
+/// </summary>
+/// <param name="hProcess">Handle to the remote process</param>
+/// <param name="pbModule"Base address of the module to with we want to change the imports></param>
+/// <param name="pbBase"></param>
+/// <param name="cbAlloc"></param>
+/// <returns></returns>
+static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD cbAlloc)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	ZeroMemory(&mbi, sizeof(mbi));
+
+	PBYTE pbLast = pbModule;
+	for (;; pbLast = (PBYTE)mbi.BaseAddress + mbi.RegionSize) {
+
+		ZeroMemory(&mbi, sizeof(mbi));
+		if (VirtualQueryEx(hProcess, (PVOID)pbLast, &mbi, sizeof(mbi)) == 0) {
+			if (GetLastError() == ERROR_INVALID_PARAMETER) {
+				break;
+			}
+			printf("VirtualQueryEx(%p) failed: %lu\n",
+				pbLast, GetLastError());
+			break;
+		}
+		// Usermode address space has such an unaligned region size always at the
+		// end and only at the end.
+		//
+		if ((mbi.RegionSize & 0xfff) == 0xfff) {
+			break;
+		}
+
+		// Skip anything other than a pure free region.
+		//
+		if (mbi.State != MEM_FREE) {
+			continue;
+		}
+
+		// Use the max of mbi.BaseAddress and pbBase, in case mbi.BaseAddress < pbBase.
+		PBYTE pbAddress = (PBYTE)mbi.BaseAddress > pbModule ? (PBYTE)mbi.BaseAddress : pbModule;
+
+		// Round pbAddress up to the nearest MM allocation boundary.
+		const DWORD_PTR mmGranularityMinusOne = (DWORD_PTR)(MM_ALLOCATION_GRANULARITY - 1);
+		pbAddress = (PBYTE)(((DWORD_PTR)pbAddress + mmGranularityMinusOne) & ~mmGranularityMinusOne);
+
+#ifdef _WIN64
+		// The offset from pbModule to any replacement import must fit into 32 bits.
+		// For simplicity, we check that the offset to the last byte fits into 32 bits,
+		// instead of the largest offset we'll actually use. The values are very similar.
+		const size_t GB4 = ((((size_t)1) << 32) - 1);
+		if ((size_t)(pbAddress + cbAlloc - 1 - pbModule) > GB4) {
+			printf("FindAndAllocateNearBase(1) failing due to distance >4GB %p\n", pbAddress);
+			return NULL;
+		}
+#else
+		UNREFERENCED_PARAMETER(pbModule);
+#endif
+
+		printf("Free region %p..%p\n",
+			mbi.BaseAddress,
+			(PBYTE)mbi.BaseAddress + mbi.RegionSize);
+
+		for (; pbAddress < (PBYTE)mbi.BaseAddress + mbi.RegionSize; pbAddress += MM_ALLOCATION_GRANULARITY) {
+			PBYTE pbAlloc = (PBYTE)VirtualAllocEx(hProcess, pbAddress, cbAlloc,
+				MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+			if (pbAlloc == NULL) {
+				printf("VirtualAllocEx(%p) failed: %lu\n", pbAddress, GetLastError());
+				continue;
+			}
+#ifdef _WIN64
+			// The offset from pbModule to any replacement import must fit into 32 bits.
+			if ((size_t)(pbAddress + cbAlloc - 1 - pbModule) > GB4) {
+				printf("FindAndAllocateNearBase(2) failing due to distance >4GB %p\n", pbAddress);
+				return NULL;
+			}
+#endif
+			printf("[%p..%p] Allocated for import table.\n",
+				pbAlloc, pbAlloc + cbAlloc);
+			return pbAlloc;
+		}
+	}
+	return NULL;
+}
+
+void* WriteToRemoteProcess(HANDLE hProcess, PBYTE pbase, LPCVOID buffer, SIZE_T size) {
+
+#ifdef _WIN64
+	auto allocatedBuffer = FindAndAllocateNearBase(hProcess, pbase, size);
+#else
+	auto allocatedBuffer = VirtualAllocEx(hProcess, NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#endif
+	
+
+	//auto allocatedBuffer = VirtualAllocEx(hProcess, NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	if (allocatedBuffer == NULL)
+	{
+		printf("VirtualAllocEx failed. Error: %d\n", GetLastError());
+		return nullptr;
+	}
+
+	// write import lookup table to remote process buffer
+	if (WriteProcessMemory(hProcess, (void*)allocatedBuffer, (void*)buffer, size, NULL) == 0)
+	{
+		printf("WriteProcessMemory failed. Error: %d\n", GetLastError());
+	}
+	return allocatedBuffer;
+}
 
 DWORD LaunchTargetProcess(const char* pExePath, HANDLE* phProcess, HANDLE* phProcessMainThread)
 {
@@ -43,22 +161,6 @@ DWORD LaunchTargetProcess(const char* pExePath, HANDLE* phProcess, HANDLE* phPro
 	*phProcessMainThread = ProcessInfo.hThread;
 
 	return 0;
-}
-
-void* WriteToRemoteProcess(HANDLE hProcess, LPCVOID buffer, SIZE_T size) {
-	auto allocatedBuffer = VirtualAllocEx(hProcess, NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-	if (allocatedBuffer == NULL)
-	{
-		printf("VirtualAllocEx failed. Error: %d\n", GetLastError());
-		return nullptr;
-	}
-
-	// write import lookup table to remote process buffer
-	if (WriteProcessMemory(hProcess, (void*)allocatedBuffer, (void*)buffer, size, NULL) == 0)
-	{
-		printf("WriteProcessMemory failed. Error: %d\n", GetLastError());
-	}
-	return allocatedBuffer;
 }
 
 DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath)
@@ -129,7 +231,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	dwDllPathLength = strlen(pDllPath) + 1;
 
 	// allocate buffer for the dll path in the remote process
-	if (pRemoteAlloc_DllPath = WriteToRemoteProcess(hProcess, pDllPath, dwDllPathLength); !pRemoteAlloc_DllPath) {
+	if (pRemoteAlloc_DllPath = WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, pDllPath, dwDllPathLength); !pRemoteAlloc_DllPath) {
 		return 1;
 	}
 
@@ -138,13 +240,13 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	dwImportLookupTable[1].u1.Ordinal = 0;
 
 	// allocate buffer for the new import lookup table in the remote process
-	if (pRemoteAlloc_ImportLookupTable = WriteToRemoteProcess(hProcess, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportLookupTable) {
+	if (pRemoteAlloc_ImportLookupTable = WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportLookupTable) {
 		return 1;
 	}
 
 
 	// allocate buffer for the new import address table in the remote process
-	if (pRemoteAlloc_ImportAddressTable = WriteToRemoteProcess(hProcess, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportAddressTable) {
+	if (pRemoteAlloc_ImportAddressTable = WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportAddressTable) {
 		return 1;
 	}
 
@@ -199,7 +301,9 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	pCopyImportDescriptorDataPtr = pNewImportDescriptorList + dwNewImportDescriptorListDataLength - sizeof(NewDllImportDescriptors);
 	memcpy(pCopyImportDescriptorDataPtr, (void*)NewDllImportDescriptors, sizeof(NewDllImportDescriptors));
 	// allocate buffer for the new import descriptor list in the remote process
-	if (pRemoteAlloc_NewImportDescriptorList = WriteToRemoteProcess(hProcess, pNewImportDescriptorList, dwNewImportDescriptorListDataLength); !pRemoteAlloc_NewImportDescriptorList) {
+	//auto pNewNearImports =  FindAndAllocateNearBase(hProcess, (PBYTE)dwExeBaseAddr, dwNewImportDescriptorListDataLength);
+	void* pNewNearImports= WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, pNewImportDescriptorList, dwNewImportDescriptorListDataLength);
+	if (!pNewNearImports) {
 		return 1;
 	}
 
@@ -209,7 +313,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	printf("Updating PE headers...\n");
 
 	// change the import descriptor address in the remote NT header to point to the new list
-	ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = (PBYTE)pRemoteAlloc_NewImportDescriptorList - dwExeBaseAddr;
+	ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = (PBYTE)pNewNearImports - dwExeBaseAddr;
 	ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size = dwNewImportDescriptorListDataLength;
 
 	// make NT header writable
@@ -273,6 +377,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	VirtualFreeEx(hProcess, pRemoteAlloc_ImportLookupTable, 0, MEM_RELEASE);
 	VirtualFreeEx(hProcess, pRemoteAlloc_ImportAddressTable, 0, MEM_RELEASE);
 	VirtualFreeEx(hProcess, pRemoteAlloc_NewImportDescriptorList, 0, MEM_RELEASE);
+	VirtualFreeEx(hProcess, (LPVOID)pNewNearImports, 0, MEM_RELEASE);
 
 	return 0;
 }
@@ -282,16 +387,29 @@ int main(int argc, char* argv[])
 {
 	HANDLE hProcess = NULL;
 	HANDLE hProcessMainThread = NULL;
-#ifdef WIN64
-	const char* pExePath = R"(C:\Users\OfirKantor\OneDrive - morphisec.com\MyRepos\Tests2\x64\Release\debugee.exe)";
-	const char* pInjectDllPath = R"(C:\Users\OfirKantor\OneDrive - morphisec.com\MyRepos\DllTests\x64\Release\DllTests.dll)";
-#else
-	const char* pExePath = R"(C:\Users\OfirKantor\OneDrive - morphisec.com\MyRepos\Tests2\Release\debugee.exe)";
-	const char* pInjectDllPath = R"(C:\Users\OfirKantor\OneDrive - morphisec.com\MyRepos\DllTests\Release\DllTests.dll)";
-#endif
+	char szInjectDllFullPath[512];
+	char* pInjectDllPath = NULL;
+	char* pExePath = NULL;
 
+	if (argc != 3)
+	{
+		printf("Usage: %s [exe_path] [inject_dll_path]\n\n", argv[0]);
 
-	char szInjectDllFullPath[MAX_PATH];
+		return 1;
+	}
+
+	// get params
+	pExePath = argv[1];
+	pInjectDllPath = argv[2];
+
+	// get full path from dll filename
+	memset(szInjectDllFullPath, 0, sizeof(szInjectDllFullPath));
+	if (GetFullPathNameA(pInjectDllPath, sizeof(szInjectDllFullPath) - 1, szInjectDllFullPath, NULL) == 0)
+	{
+		printf("Invalid DLL path\n");
+
+		return 1;
+	}
 
 	////get full path from dll filename
 	memset(szInjectDllFullPath, 0, sizeof(szInjectDllFullPath));
