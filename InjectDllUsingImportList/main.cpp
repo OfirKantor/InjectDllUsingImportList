@@ -4,6 +4,7 @@
 #include <iostream>
 #include <windows.h>
 #include "ntdll.h"
+#include "wil\resource.h"
 
 // The dll need to have at least 1 imported function in order for the loader to load the dll.
 // We tell the loader to look for a function by its ordinal number - 1.
@@ -139,7 +140,12 @@ void* WriteToRemoteProcess(HANDLE hProcess, PBYTE pbase, LPCVOID buffer, SIZE_T 
 	return allocatedBuffer;
 }
 
-DWORD LaunchTargetProcess(const char* pExePath, HANDLE* phProcess, HANDLE* phProcessMainThread)
+/// <summary>
+/// launches a process in suspended mode
+/// </summary>
+/// <param name="pExePath">- path to the exe file</param>
+/// <returns>A tuple with two wil::unique_handle values - {process handle, main thread handle}</returns>
+std::tuple<wil::unique_handle, wil::unique_handle> LaunchTargetProcess(const char* pExePath)
 {
 	PROCESS_INFORMATION ProcessInfo;
 	STARTUPINFOA StartupInfo;
@@ -154,17 +160,13 @@ DWORD LaunchTargetProcess(const char* pExePath, HANDLE* phProcess, HANDLE* phPro
 	memset((void*)&ProcessInfo, 0, sizeof(ProcessInfo));
 	if (CreateProcessA(NULL, (LPSTR)pExePath, NULL, NULL, 0, CREATE_SUSPENDED, NULL, NULL, &StartupInfo, &ProcessInfo) == 0)
 	{
-		return 1;
+		return std::make_tuple(nullptr, nullptr);
 	}
 
-	// store handles
-	*phProcess = ProcessInfo.hProcess;
-	*phProcessMainThread = ProcessInfo.hThread;
-
-	return 0;
+	return std::make_tuple(wil::unique_handle(ProcessInfo.hProcess), wil::unique_handle(ProcessInfo.hThread));;
 }
 
-DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath)
+DWORD InjectDll(wil::unique_handle& hProcess, wil::unique_handle& hProcessMainThread, const char* pDllPath)
 {
 
 	printf("Reading image base address from PEB...\n");
@@ -172,7 +174,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	// get process info
 	PROCESS_BASIC_INFORMATION ProcessBasicInfo;
 	memset(&ProcessBasicInfo, 0, sizeof(ProcessBasicInfo));
-	auto status = NtQIP(hProcess, ProcessBasicInformation, &ProcessBasicInfo, sizeof(ProcessBasicInfo), NULL);
+	auto status = NtQIP(hProcess.get(), ProcessBasicInformation, &ProcessBasicInfo, sizeof(ProcessBasicInfo), NULL);
 	if (status != 0)
 	{
 		return 1;
@@ -182,7 +184,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	void* dwRemotePebPtr = 0;
 	// get target exe PEB address
 	dwRemotePebPtr = ProcessBasicInfo.PebBaseAddress;
-	if (auto ret = ReadProcessMemory(hProcess, dwRemotePebPtr, (void*)&remoteExePeb, sizeof(remoteExePeb), NULL); ret == 0)
+	if (auto ret = ReadProcessMemory(hProcess.get(), dwRemotePebPtr, (void*)&remoteExePeb, sizeof(remoteExePeb), NULL); ret == 0)
 	{
 		auto err = GetLastError();
 		return 1;
@@ -191,7 +193,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	// get target exe base address
 	IMAGE_DOS_HEADER ImageDosHeader;
 	void* dwExeBaseAddr = remoteExePeb.ImageBaseAddress;
-	if (auto ret = ReadProcessMemory(hProcess, dwExeBaseAddr, (void*)&ImageDosHeader, sizeof(ImageDosHeader), NULL); ret == 0)
+	if (auto ret = ReadProcessMemory(hProcess.get(), dwExeBaseAddr, (void*)&ImageDosHeader, sizeof(ImageDosHeader), NULL); ret == 0)
 	{
 		auto err = GetLastError();
 		return 1;
@@ -201,7 +203,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	IMAGE_NT_HEADERS ImageNtHeader;
 	void* dwNtHeaderAddr = (PBYTE)dwExeBaseAddr + ImageDosHeader.e_lfanew;
 	memset((void*)&ImageNtHeader, 0, sizeof(ImageNtHeader));
-	if (ReadProcessMemory(hProcess, (void*)dwNtHeaderAddr, (void*)&ImageNtHeader, sizeof(ImageNtHeader), NULL) == 0)
+	if (ReadProcessMemory(hProcess.get(), (void*)dwNtHeaderAddr, (void*)&ImageNtHeader, sizeof(ImageNtHeader), NULL) == 0)
 	{
 		return 1;
 	}
@@ -215,7 +217,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 
 	// allocate buffer for the dll path in the remote process
 	void* pRemoteAlloc_DllPath = NULL;
-	if (pRemoteAlloc_DllPath = WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, pDllPath, dwDllPathLength); !pRemoteAlloc_DllPath) {
+	if (pRemoteAlloc_DllPath = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, pDllPath, dwDllPathLength); !pRemoteAlloc_DllPath) {
 		return 1;
 	}
 
@@ -226,14 +228,14 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 
 	// allocate buffer for the new import lookup table in the remote process
 	void* pRemoteAlloc_ImportLookupTable = NULL;
-	if (pRemoteAlloc_ImportLookupTable = WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportLookupTable) {
+	if (pRemoteAlloc_ImportLookupTable = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportLookupTable) {
 		return 1;
 	}
 
 
 	// allocate buffer for the new import address table in the remote process
 	void* pRemoteAlloc_ImportAddressTable = NULL;
-	if (pRemoteAlloc_ImportAddressTable = WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportAddressTable) {
+	if (pRemoteAlloc_ImportAddressTable = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportAddressTable) {
 		return 1;
 	}
 
@@ -282,7 +284,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 		void* dwExistingImportDescriptorAddr = 0;
 
 		dwExistingImportDescriptorAddr = (PBYTE)dwExeBaseAddr + ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-		if (ReadProcessMemory(hProcess, (void*)dwExistingImportDescriptorAddr, pNewImportDescriptorList, dwExistingImportDescriptorEntryCount * sizeof(IMAGE_IMPORT_DESCRIPTOR), NULL) == 0)
+		if (ReadProcessMemory(hProcess.get(), (void*)dwExistingImportDescriptorAddr, pNewImportDescriptorList, dwExistingImportDescriptorEntryCount * sizeof(IMAGE_IMPORT_DESCRIPTOR), NULL) == 0)
 		{
 			free(pNewImportDescriptorList);
 			return 1;
@@ -294,7 +296,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	memcpy(pCopyImportDescriptorDataPtr, (void*)NewDllImportDescriptors, sizeof(NewDllImportDescriptors));
 	// allocate buffer for the new import descriptor list in the remote process
 	//auto pNewNearImports =  FindAndAllocateNearBase(hProcess, (PBYTE)dwExeBaseAddr, dwNewImportDescriptorListDataLength);
-	void* pNewNearImports= WriteToRemoteProcess(hProcess, (PBYTE)dwExeBaseAddr, pNewImportDescriptorList, dwNewImportDescriptorListDataLength);
+	void* pNewNearImports= WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, pNewImportDescriptorList, dwNewImportDescriptorListDataLength);
 	if (!pNewNearImports) {
 		return 1;
 	}
@@ -310,13 +312,13 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 
 	// make NT header writable
 	DWORD dwOriginalProtection = 0;
-	if (VirtualProtectEx(hProcess, (LPVOID)dwNtHeaderAddr, sizeof(ImageNtHeader), PAGE_EXECUTE_READWRITE, &dwOriginalProtection) == 0)
+	if (VirtualProtectEx(hProcess.get(), (LPVOID)dwNtHeaderAddr, sizeof(ImageNtHeader), PAGE_EXECUTE_READWRITE, &dwOriginalProtection) == 0)
 	{
 		return 1;
 	}
 
 	// write updated NT header to remote process
-	if (WriteProcessMemory(hProcess, (void*)dwNtHeaderAddr, (void*)&ImageNtHeader, sizeof(ImageNtHeader), NULL) == 0)
+	if (WriteProcessMemory(hProcess.get(), (void*)dwNtHeaderAddr, (void*)&ImageNtHeader, sizeof(ImageNtHeader), NULL) == 0)
 	{
 		return 1;
 	}
@@ -324,7 +326,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	printf("Resuming process...\n");
 
 	// resume target process execution
-	ResumeThread(hProcessMainThread);
+	ResumeThread(hProcessMainThread.get());
 
 	printf("Waiting for target DLL...\n");
 
@@ -335,7 +337,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 		IMAGE_THUNK_DATA dwCurrentImportAddressTable[2];
 
 		memset((void*)dwCurrentImportAddressTable, 0, sizeof(dwCurrentImportAddressTable));
-		if (ReadProcessMemory(hProcess, (void*)pRemoteAlloc_ImportAddressTable, (void*)dwCurrentImportAddressTable, sizeof(dwCurrentImportAddressTable), NULL) == 0)
+		if (ReadProcessMemory(hProcess.get(), (void*)pRemoteAlloc_ImportAddressTable, (void*)dwCurrentImportAddressTable, sizeof(dwCurrentImportAddressTable), NULL) == 0)
 		{
 			return 1;
 		}
@@ -356,23 +358,23 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 	printf("Restoring original PE headers...\n");
 
 	// restore original NT headers in target process
-	if (WriteProcessMemory(hProcess, (void*)dwNtHeaderAddr, (void*)&ImageNtHeader_Original, sizeof(ImageNtHeader), NULL) == 0)
+	if (WriteProcessMemory(hProcess.get(), (void*)dwNtHeaderAddr, (void*)&ImageNtHeader_Original, sizeof(ImageNtHeader), NULL) == 0)
 	{
 		return 1;
 	}
 
 	// restore original protection value for remote NT headers
 	DWORD dwOriginalProtection2 = 0;
-	if (VirtualProtectEx(hProcess, (LPVOID)dwNtHeaderAddr, sizeof(ImageNtHeader), dwOriginalProtection, &dwOriginalProtection2) == 0)
+	if (VirtualProtectEx(hProcess.get(), (LPVOID)dwNtHeaderAddr, sizeof(ImageNtHeader), dwOriginalProtection, &dwOriginalProtection2) == 0)
 	{
 		return 1;
 	}
 
 	// free temporary memory in remote process
-	VirtualFreeEx(hProcess, pRemoteAlloc_DllPath, 0, MEM_RELEASE);
-	VirtualFreeEx(hProcess, pRemoteAlloc_ImportLookupTable, 0, MEM_RELEASE);
-	VirtualFreeEx(hProcess, pRemoteAlloc_ImportAddressTable, 0, MEM_RELEASE);
-	VirtualFreeEx(hProcess, (LPVOID)pNewNearImports, 0, MEM_RELEASE);
+	VirtualFreeEx(hProcess.get(), pRemoteAlloc_DllPath, 0, MEM_RELEASE);
+	VirtualFreeEx(hProcess.get(), pRemoteAlloc_ImportLookupTable, 0, MEM_RELEASE);
+	VirtualFreeEx(hProcess.get(), pRemoteAlloc_ImportAddressTable, 0, MEM_RELEASE);
+	VirtualFreeEx(hProcess.get(), (LPVOID)pNewNearImports, 0, MEM_RELEASE);
 
 	return 0;
 }
@@ -380,8 +382,7 @@ DWORD InjectDll(HANDLE hProcess, HANDLE hProcessMainThread, const char* pDllPath
 
 int main(int argc, char* argv[])
 {
-	HANDLE hProcess = NULL;
-	HANDLE hProcessMainThread = NULL;
+
 	char szInjectDllFullPath[512];
 	char* pInjectDllPath = NULL;
 	char* pExePath = NULL;
@@ -425,21 +426,20 @@ int main(int argc, char* argv[])
 	}
 
 	// launch target process
-	if (LaunchTargetProcess(pExePath, &hProcess, &hProcessMainThread) != 0)
+	auto handles = LaunchTargetProcess(pExePath);
+	if (!std::get<0>(handles).is_valid() || !std::get<1>(handles).is_valid())
 	{
 		printf("Failed to launch target process\n");
 
 		return 1;
 	}
 
-	if (InjectDll(hProcess, hProcessMainThread, szInjectDllFullPath) != 0)
+	if (InjectDll(std::get<0>(handles), std::get<1>(handles), szInjectDllFullPath) != 0)
 	{
 		printf("Failed to inject DLL\n");
 
 		// error
-		TerminateProcess(hProcess, 0);
-		CloseHandle(hProcessMainThread);
-		CloseHandle(hProcess);
+		TerminateProcess(std::get<0>(handles).get(), 0);
 
 		return 1;
 	}
