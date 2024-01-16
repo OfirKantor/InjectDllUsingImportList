@@ -4,6 +4,7 @@
 #include <iostream>
 #include <windows.h>
 #include "ntdll.h"
+#include <memory>
 #include "wil\resource.h"
 
 // The dll need to have at least 1 imported function in order for the loader to load the dll.
@@ -25,6 +26,11 @@ typedef NTSTATUS
 	_Out_opt_ PULONG ReturnLength
 	);
 
+enum ImportDescriptorPosition {
+	FIRST = 0,
+	LAST
+};
+
 pNtQueryInformationProcess NtQIP = nullptr;
 
 // taken from MSDetours
@@ -38,7 +44,7 @@ pNtQueryInformationProcess NtQIP = nullptr;
 /// <param name="pbModule"Base address of the module to with we want to change the imports></param>
 /// <param name="size">allocation size</param>
 /// <returns></returns>
-static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD size)
+static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD size, const char* allocationName)
 {
 	MEMORY_BASIC_INFORMATION mbi;
 	ZeroMemory(&mbi, sizeof(mbi));
@@ -106,8 +112,8 @@ static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD size
 				return NULL;
 			}
 #endif
-			printf("[%p..%p] Allocated for import table.\n",
-				pbAlloc, pbAlloc + size);
+			printf("[%p..%p] Allocated for %s.\n",
+				pbAlloc, pbAlloc + size, allocationName);
 			return pbAlloc;
 		}
 	}
@@ -116,14 +122,14 @@ static PBYTE FindAndAllocateNearBase(HANDLE hProcess, PBYTE pbModule, DWORD size
 
 // Allocate and write buffer into hProcess's memory
 // If that is a 64 bit process, we need to alocate memory near the base address of the module so the (DWORD) relative address pointers will work properly.
-void* WriteToRemoteProcess(HANDLE hProcess, PBYTE pbase, LPCVOID buffer, SIZE_T size) {
+void* WriteToRemoteProcess(HANDLE hProcess, PBYTE pbase, LPCVOID buffer, SIZE_T size, const char* allocationName) {
 
 #ifdef _WIN64
-	auto allocatedBuffer = FindAndAllocateNearBase(hProcess, pbase, size);
+	auto allocatedBuffer = FindAndAllocateNearBase(hProcess, pbase, size, allocationName);
 #else
 	auto allocatedBuffer = VirtualAllocEx(hProcess, NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #endif
-	
+
 
 	//auto allocatedBuffer = VirtualAllocEx(hProcess, NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	if (allocatedBuffer == NULL)
@@ -166,7 +172,80 @@ std::tuple<wil::unique_handle, wil::unique_handle> LaunchTargetProcess(const cha
 	return std::make_tuple(wil::unique_handle(ProcessInfo.hProcess), wil::unique_handle(ProcessInfo.hThread));;
 }
 
-DWORD InjectDll(wil::unique_handle& hProcess, wil::unique_handle& hProcessMainThread, const char* pDllPath)
+std::tuple<std::shared_ptr<void>, DWORD> CreateNewImportDescriptor(wil::unique_handle& hProcess, void* pRemoteAlloc_ImportLookupTable, void* dwExeBaseAddr, void* pRemoteAlloc_DllPath, void* pRemoteAlloc_ImportAddressTable, const IMAGE_NT_HEADERS& ImageNtHeader, ImportDescriptorPosition pos) {
+
+	IMAGE_IMPORT_DESCRIPTOR NewDllImportDescriptors[2];
+
+	NewDllImportDescriptors[0].OriginalFirstThunk = (PBYTE)pRemoteAlloc_ImportLookupTable - dwExeBaseAddr;
+	NewDllImportDescriptors[0].TimeDateStamp = 0;
+	NewDllImportDescriptors[0].ForwarderChain = 0;
+	NewDllImportDescriptors[0].Name = (PBYTE)pRemoteAlloc_DllPath - dwExeBaseAddr;
+	NewDllImportDescriptors[0].FirstThunk = (PBYTE)pRemoteAlloc_ImportAddressTable - dwExeBaseAddr;
+
+	// end of import descriptor chain (only in use if we add the new import descriptor at the end of the list)
+	NewDllImportDescriptors[1].OriginalFirstThunk = 0;
+	NewDllImportDescriptors[1].TimeDateStamp = 0;
+	NewDllImportDescriptors[1].ForwarderChain = 0;
+	NewDllImportDescriptors[1].Name = 0;
+	NewDllImportDescriptors[1].FirstThunk = 0;
+
+	// calculate existing number of imported dll modules
+	DWORD dwExistingImportDescriptorEntryCount = ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+	DWORD dwNewImportDescriptorEntryCount = 0;
+
+	if (dwExistingImportDescriptorEntryCount == 0)
+	{
+		// the target process doesn't have any imported dll entries - this is highly unusual but not impossible
+		dwNewImportDescriptorEntryCount = 2;
+	}
+	else
+	{
+		// add one extra dll entry
+		dwNewImportDescriptorEntryCount = dwExistingImportDescriptorEntryCount + 1;
+	}
+
+	// allocate new import description list (local)
+	DWORD dwNewImportDescriptorListDataLength = dwNewImportDescriptorEntryCount * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+	std::shared_ptr<void> pNewImportDescriptorList(malloc(dwNewImportDescriptorListDataLength), free);
+	if (pNewImportDescriptorList == nullptr)
+	{
+		return std::make_tuple(nullptr, 0);
+	}
+
+	if (dwExistingImportDescriptorEntryCount != 0)
+	{
+		// read existing import descriptor entries
+		void* dwExistingImportDescriptorAddr = 0;
+		void* newDescriptorPos = nullptr;
+		void* oldDescriptorsPos = nullptr;
+
+		switch (pos) {
+		case(ImportDescriptorPosition::FIRST):
+			newDescriptorPos = pNewImportDescriptorList.get(); // raw shared pointer! make sure not dangling
+			oldDescriptorsPos = (PBYTE)newDescriptorPos + sizeof(IMAGE_IMPORT_DESCRIPTOR);
+			break;
+
+		case(ImportDescriptorPosition::LAST):
+			oldDescriptorsPos = pNewImportDescriptorList.get();// raw shared pointer! make sure not dangling
+			newDescriptorPos = (PBYTE)oldDescriptorsPos + dwNewImportDescriptorListDataLength - sizeof(NewDllImportDescriptors);
+			break;
+
+		default:
+			break;
+		}
+
+		memcpy(newDescriptorPos, NewDllImportDescriptors, sizeof(NewDllImportDescriptors));
+		if (ReadProcessMemory(hProcess.get(), (void*)dwExistingImportDescriptorAddr, oldDescriptorsPos, dwExistingImportDescriptorEntryCount * sizeof(IMAGE_IMPORT_DESCRIPTOR), NULL) == 0)
+		{
+			return std::make_tuple(nullptr, 0);
+		}
+
+	}
+
+	return std::make_tuple(pNewImportDescriptorList, dwNewImportDescriptorListDataLength);
+}
+
+DWORD InjectDll(wil::unique_handle& hProcess, wil::unique_handle& hProcessMainThread, const char* pDllPath, ImportDescriptorPosition pos)
 {
 
 	printf("Reading image base address from PEB...\n");
@@ -217,7 +296,7 @@ DWORD InjectDll(wil::unique_handle& hProcess, wil::unique_handle& hProcessMainTh
 
 	// allocate buffer for the dll path in the remote process
 	void* pRemoteAlloc_DllPath = NULL;
-	if (pRemoteAlloc_DllPath = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, pDllPath, dwDllPathLength); !pRemoteAlloc_DllPath) {
+	if (pRemoteAlloc_DllPath = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, pDllPath, dwDllPathLength, "dll path"); !pRemoteAlloc_DllPath) {
 		return 1;
 	}
 
@@ -228,81 +307,25 @@ DWORD InjectDll(wil::unique_handle& hProcess, wil::unique_handle& hProcessMainTh
 
 	// allocate buffer for the new import lookup table in the remote process
 	void* pRemoteAlloc_ImportLookupTable = NULL;
-	if (pRemoteAlloc_ImportLookupTable = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportLookupTable) {
+	if (pRemoteAlloc_ImportLookupTable = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable), "lookup table"); !pRemoteAlloc_ImportLookupTable) {
 		return 1;
 	}
 
 
 	// allocate buffer for the new import address table in the remote process
 	void* pRemoteAlloc_ImportAddressTable = NULL;
-	if (pRemoteAlloc_ImportAddressTable = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable)); !pRemoteAlloc_ImportAddressTable) {
+	if (pRemoteAlloc_ImportAddressTable = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, dwImportLookupTable, sizeof(dwImportLookupTable), "address table"); !pRemoteAlloc_ImportAddressTable) {
 		return 1;
 	}
 
 	// set import descriptor values for injected dll
-	IMAGE_IMPORT_DESCRIPTOR NewDllImportDescriptors[2];
+	auto [pNewImportDescriptorList, dwNewImportDescriptorListDataLength] = CreateNewImportDescriptor(hProcess, pRemoteAlloc_ImportLookupTable, dwExeBaseAddr, pRemoteAlloc_DllPath, pRemoteAlloc_ImportAddressTable, ImageNtHeader, pos);
 
-	NewDllImportDescriptors[0].OriginalFirstThunk = (PBYTE)pRemoteAlloc_ImportLookupTable - dwExeBaseAddr;
-	NewDllImportDescriptors[0].TimeDateStamp = 0;
-	NewDllImportDescriptors[0].ForwarderChain = 0;
-	NewDllImportDescriptors[0].Name = (PBYTE)pRemoteAlloc_DllPath - dwExeBaseAddr;
-	NewDllImportDescriptors[0].FirstThunk = (PBYTE)pRemoteAlloc_ImportAddressTable - dwExeBaseAddr;
-
-	// end of import descriptor chain
-	NewDllImportDescriptors[1].OriginalFirstThunk = 0;
-	NewDllImportDescriptors[1].TimeDateStamp = 0;
-	NewDllImportDescriptors[1].ForwarderChain = 0;
-	NewDllImportDescriptors[1].Name = 0;
-	NewDllImportDescriptors[1].FirstThunk = 0;
-
-	// calculate existing number of imported dll modules
-	DWORD dwExistingImportDescriptorEntryCount = ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
-	DWORD dwNewImportDescriptorEntryCount = 0;
-
-	if (dwExistingImportDescriptorEntryCount == 0)
-	{
-		// the target process doesn't have any imported dll entries - this is highly unusual but not impossible
-		dwNewImportDescriptorEntryCount = 2;
-	}
-	else
-	{
-		// add one extra dll entry
-		dwNewImportDescriptorEntryCount = dwExistingImportDescriptorEntryCount + 1;
-	}
-
-	// allocate new import description list (local)
-	DWORD dwNewImportDescriptorListDataLength = dwNewImportDescriptorEntryCount * sizeof(IMAGE_IMPORT_DESCRIPTOR);
-	auto pNewImportDescriptorList = (BYTE*)malloc(dwNewImportDescriptorListDataLength);
-	if (pNewImportDescriptorList == NULL)
-	{
-		return 1;
-	}
-
-	if (dwExistingImportDescriptorEntryCount != 0)
-	{
-		// read existing import descriptor entries
-		void* dwExistingImportDescriptorAddr = 0;
-
-		dwExistingImportDescriptorAddr = (PBYTE)dwExeBaseAddr + ImageNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-		if (ReadProcessMemory(hProcess.get(), (void*)dwExistingImportDescriptorAddr, pNewImportDescriptorList, dwExistingImportDescriptorEntryCount * sizeof(IMAGE_IMPORT_DESCRIPTOR), NULL) == 0)
-		{
-			free(pNewImportDescriptorList);
-			return 1;
-		}
-	}
-
-	// copy the new dll import (and terminator entry) to the end of the list
-	BYTE* pCopyImportDescriptorDataPtr = pNewImportDescriptorList + dwNewImportDescriptorListDataLength - sizeof(NewDllImportDescriptors);
-	memcpy(pCopyImportDescriptorDataPtr, (void*)NewDllImportDescriptors, sizeof(NewDllImportDescriptors));
-	// allocate buffer for the new import descriptor list in the remote process
 	//auto pNewNearImports =  FindAndAllocateNearBase(hProcess, (PBYTE)dwExeBaseAddr, dwNewImportDescriptorListDataLength);
-	void* pNewNearImports= WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, pNewImportDescriptorList, dwNewImportDescriptorListDataLength);
+	void* pNewNearImports = WriteToRemoteProcess(hProcess.get(), (PBYTE)dwExeBaseAddr, pNewImportDescriptorList.get(), dwNewImportDescriptorListDataLength, "import descriptor list");
 	if (!pNewNearImports) {
 		return 1;
 	}
-
-	// free local import descriptor list buffer
-	free(pNewImportDescriptorList);
 
 	printf("Updating PE headers...\n");
 
@@ -426,20 +449,19 @@ int main(int argc, char* argv[])
 	}
 
 	// launch target process
-	auto handles = LaunchTargetProcess(pExePath);
-	if (!std::get<0>(handles).is_valid() || !std::get<1>(handles).is_valid())
+	auto [hProc, hThread] = LaunchTargetProcess(pExePath);
+	if (!hProc.is_valid() || !hThread.is_valid())
 	{
 		printf("Failed to launch target process\n");
 
 		return 1;
 	}
 
-	if (InjectDll(std::get<0>(handles), std::get<1>(handles), szInjectDllFullPath) != 0)
+	if (InjectDll(hProc, hThread, szInjectDllFullPath, ImportDescriptorPosition::FIRST) != 0)
 	{
 		printf("Failed to inject DLL\n");
 
-		// error
-		TerminateProcess(std::get<0>(handles).get(), 0);
+		TerminateProcess(hProc.get(), 0);
 
 		return 1;
 	}
