@@ -1,4 +1,4 @@
-# Injecting a dll into an executable by adding an imports descriptor to the import table.
+# Injecting a dll into an executable by adding an import descriptor to the import table.
 
 based on the great post by https://www.x86matthew.com/view_post?id=import_dll_injection
 
