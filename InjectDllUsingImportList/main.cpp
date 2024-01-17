@@ -180,7 +180,7 @@ std::tuple<wil::unique_handle, wil::unique_handle> LaunchTargetProcess(const cha
 /// <param name="pRemoteAlloc_DllPath"adress of the dll path allocated in the target process</param>
 /// <param name="pRemoteAlloc_ImportAddressTable">adress of the import address table allocated in the target process</param>
 /// <param name="ImageNtHeader"></param>
-/// <param name="pos"></param>
+/// <param name="pos">ImportDescriptorPosition value: FIRST - add our descriptor on index 0. LAST - add it last in the descriptors list</param>
 /// <returns>a tuple of {shared_ptr to the new ImportDescriptorList, the ImportDescriptorList length}</returns>
 std::tuple<std::shared_ptr<void>, DWORD> CreateNewImportDescriptor(wil::unique_handle& hProcess, void* pRemoteAlloc_ImportLookupTable, void* dwExeBaseAddr, void* pRemoteAlloc_DllPath, void* pRemoteAlloc_ImportAddressTable, const IMAGE_NT_HEADERS& ImageNtHeader, ImportDescriptorPosition pos) {
 
@@ -246,6 +246,8 @@ std::tuple<std::shared_ptr<void>, DWORD> CreateNewImportDescriptor(wil::unique_h
 			break;
 
 		default:
+			printf("Descriptor position not valid (%d)", pos);
+			return std::make_tuple(nullptr, 0);
 			break;
 		}
 
