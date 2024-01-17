@@ -12,5 +12,5 @@ based on the great post by https://www.x86matthew.com/view_post?id=import_dll_in
 ## Notice
 
 32/64 bit InjectDllUsingImportList.exe should be used with 32/64 bit exe and dll, respectively.
-In the 64 bit version, we need to make sure that the relative pointers within the PE structures are close enough to the exe base address (and can be stored in a 32 bit DWORD), for the whole thing to work.
+In the 64 bit version, we need to make sure that the relative pointers within the PE structures are close enough to the exe's base address (and can be stored in a 32 bit DWORD), for the whole thing to work.
 For this purpose, in the 64 bit version we use MSDetours function called _FindAndAllocateNearBase()_.
