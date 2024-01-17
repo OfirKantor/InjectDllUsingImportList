@@ -6,7 +6,8 @@ based on the great post by https://www.x86matthew.com/view_post?id=import_dll_in
 
 1. Download and build the repo.
 2. Run the program:
-   InjectDllUsingImportList.exe <path-to-exe> <path-to-injected-dll>
+
+   InjectDllUsingImportList.exe (_path-to-exe_) (_path-to-injected-dll_)
 
 ## Notice
 
