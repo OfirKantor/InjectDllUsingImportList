@@ -7,14 +7,15 @@
 #include <memory>
 #include "wil\resource.h"
 
-// The dll need to have at least 1 imported function in order for the loader to load the dll.
-// We tell the loader to look for a function by its ordinal number - 1.
+// The dll need to have at least 1 exported function in order for the loader to load the dll.
+// We tell the loader to look for a function by its ordinal number.
 // To make the loader look by ordinal numbert, we set the highest bit to 1.
+// we set the actual number on main - where we find the first ordinal number available.
 // (https://learn.microsoft.com/en-us/archive/msdn-magazine/2002/march/inside-windows-an-in-depth-look-into-the-win32-portable-executable-file-format-part-2)
 #ifdef _WIN64
-uint64_t ordinal = 0x8000000000000001;
+uint64_t ordinal = 0x8000000000000000;
 #else
-uint32_t ordinal = 0x80000001;
+uint32_t ordinal = 0x80000000;
 #endif
 
 typedef NTSTATUS
@@ -35,6 +36,51 @@ pNtQueryInformationProcess NtQIP = nullptr;
 
 // taken from MSDetours
 //https://github.com/microsoft/Detours/tree/4b8c659f549b0ab21cf649377c7a84eb708f5e68
+
+WORD FindFirstOrdinalNumber(const char* dllFilePath) {
+	// Open the DLL file
+	HANDLE hFile = CreateFileA(dllFilePath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (hFile == INVALID_HANDLE_VALUE) {
+		printf("Error opening DLL file: \n", GetLastError());
+		return 0;
+	}
+
+	// Create a file mapping object
+	HANDLE hMapping = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+	if (hMapping == nullptr) {
+		printf("Error creating file mapping: \n", GetLastError());
+		CloseHandle(hFile);
+		return 0;
+	}
+
+	// Map the DLL into memory
+	LPVOID baseAddress = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+	if (baseAddress == nullptr) {
+		printf("Error mapping view of file: \n", GetLastError());
+		CloseHandle(hMapping);
+		CloseHandle(hFile);
+		return 0;
+	}
+
+	// Get the export directory
+	IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)(baseAddress);
+	IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)((char*)(baseAddress)+dosHeader->e_lfanew);
+	IMAGE_EXPORT_DIRECTORY* exportDir = (IMAGE_EXPORT_DIRECTORY*)((char*)(baseAddress)+ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+	// get the lowest exported function ordinal.
+	// TODO: this might be problematic if the first exported function is exported by ordinal, rather then by name.
+	// need to check this scenario.
+	WORD ordinal = 0;
+	if (exportDir->NumberOfNames > 0) {
+		ordinal += exportDir->Base;
+	}
+
+	// Clean up
+	UnmapViewOfFile(baseAddress);
+	CloseHandle(hMapping);
+	CloseHandle(hFile);
+	return ordinal;
+}
 
 #define MM_ALLOCATION_GRANULARITY 0x10000
 /// <summary>
@@ -433,6 +479,7 @@ DWORD InjectDll(wil::unique_handle& hProcess, wil::unique_handle& hProcessMainTh
 }
 
 
+
 int main(int argc, char* argv[])
 {
 
@@ -492,6 +539,13 @@ int main(int argc, char* argv[])
 
 		return 1;
 	}
+
+	auto exportOrdinal = FindFirstOrdinalNumber(szInjectDllFullPath);
+	if (exportOrdinal == 0) {
+		printf("No exported functions found on target dll. Can't inject it using import list");
+			return 1;
+	}
+	ordinal |= exportOrdinal;
 
 	if (InjectDll(hProc, hThread, szInjectDllFullPath) != 0)
 	{
