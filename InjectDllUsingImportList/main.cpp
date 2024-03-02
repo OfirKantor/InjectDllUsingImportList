@@ -42,32 +42,30 @@ pNtQueryInformationProcess NtQIP = nullptr;
 
 WORD FindFirstOrdinalNumber(const char* dllFilePath) {
 	// Open the DLL file
-	HANDLE hFile = CreateFileA(dllFilePath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (hFile == INVALID_HANDLE_VALUE) {
+	wil::unique_handle hFile(CreateFileA(dllFilePath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+	if (!hFile.is_valid()) {
 		printf("Error opening DLL file: \n", GetLastError());
 		return 0;
 	}
 
 	// Create a file mapping object
-	HANDLE hMapping = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-	if (hMapping == nullptr) {
+	wil::unique_handle hMapping(CreateFileMappingA(hFile.get(), nullptr, PAGE_READONLY, 0, 0, nullptr));
+	if (!hMapping.is_valid()) {
 		printf("Error creating file mapping: \n", GetLastError());
-		CloseHandle(hFile);
 		return 0;
 	}
 
 	// Map the DLL into memory
-	LPVOID baseAddress = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+	wil::unique_mapview_ptr<void> baseAddress(MapViewOfFile(hMapping.get(), FILE_MAP_READ, 0, 0, 0));
+
 	if (baseAddress == nullptr) {
 		printf("Error mapping view of file: \n", GetLastError());
-		CloseHandle(hMapping);
-		CloseHandle(hFile);
 		return 0;
 	}
 
 	IMAGE_SECTION_HEADER* section;
 	ULONG tableSize;
-	IMAGE_EXPORT_DIRECTORY* exportDir = (IMAGE_EXPORT_DIRECTORY*)ImageDirectoryEntryToDataEx(baseAddress, FALSE, IMAGE_DIRECTORY_ENTRY_EXPORT, &tableSize, &section);
+	IMAGE_EXPORT_DIRECTORY* exportDir = (IMAGE_EXPORT_DIRECTORY*)ImageDirectoryEntryToDataEx(baseAddress.get(), FALSE, IMAGE_DIRECTORY_ENTRY_EXPORT, &tableSize, &section);
 
 	if (exportDir == NULL) {
 		printf("Failed to get the export directory of the dll. Check if the dll has an export directory");
@@ -81,10 +79,6 @@ WORD FindFirstOrdinalNumber(const char* dllFilePath) {
 		ordinal += exportDir->Base;
 	}
 
-	// Clean up
-	UnmapViewOfFile(baseAddress);
-	CloseHandle(hMapping);
-	CloseHandle(hFile);
 	return ordinal;
 }
 
