@@ -6,6 +6,9 @@
 #include "ntdll.h"
 #include <memory>
 #include "wil\resource.h"
+#include <DbgHelp.h>
+
+#pragma comment (lib, "dbghelp")
 
 // The dll need to have at least 1 exported function in order for the loader to load the dll.
 // We tell the loader to look for a function by its ordinal number.
@@ -62,16 +65,19 @@ WORD FindFirstOrdinalNumber(const char* dllFilePath) {
 		return 0;
 	}
 
-	// Get the export directory
-	IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)(baseAddress);
-	IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)((char*)(baseAddress)+dosHeader->e_lfanew);
-	IMAGE_EXPORT_DIRECTORY* exportDir = (IMAGE_EXPORT_DIRECTORY*)((char*)(baseAddress)+ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+	IMAGE_SECTION_HEADER* section;
+	ULONG tableSize;
+	IMAGE_EXPORT_DIRECTORY* exportDir = (IMAGE_EXPORT_DIRECTORY*)ImageDirectoryEntryToDataEx(baseAddress, FALSE, IMAGE_DIRECTORY_ENTRY_EXPORT, &tableSize, &section);
 
+	if (exportDir == NULL) {
+		printf("Failed to get the export directory of the dll. Check if the dll has an export directory");
+		return 0;
+	}
+
+	
 	// get the lowest exported function ordinal.
-	// TODO: this might be problematic if the first exported function is exported by ordinal, rather then by name.
-	// need to check this scenario.
 	WORD ordinal = 0;
-	if (exportDir->NumberOfNames > 0) {
+	if (exportDir->NumberOfFunctions > 0) {
 		ordinal += exportDir->Base;
 	}
 
